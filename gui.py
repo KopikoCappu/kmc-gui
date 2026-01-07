@@ -103,6 +103,41 @@ class KMCBatchGUI:
         self.log_text.see(tk.END)
         self.root.update()
     
+    def normalize_fasta(self, input_file, output_file):
+        """Convert multi-line FASTA to single-line format for KMC compatibility"""
+        try:
+            with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+                current_header = None
+                current_sequence = []
+                
+                for line in infile:
+                    line = line.strip()
+                    if not line:  # Skip empty lines
+                        continue
+                    
+                    if line.startswith('>'):
+                        # Write previous sequence if exists
+                        if current_header:
+                            outfile.write(current_header + '\n')
+                            outfile.write(''.join(current_sequence) + '\n')
+                        
+                        # Start new sequence
+                        current_header = line
+                        current_sequence = []
+                    else:
+                        # Accumulate sequence lines
+                        current_sequence.append(line)
+                
+                # Write last sequence
+                if current_header:
+                    outfile.write(current_header + '\n')
+                    outfile.write(''.join(current_sequence) + '\n')
+            
+            return True
+        except Exception as e:
+            self.log(f"  ✗ ERROR normalizing FASTA: {str(e)}")
+            return False
+    
     def run_batch(self):
         # Validate inputs
         kmc_exe = self.kmc_exe_entry.get()
@@ -134,6 +169,10 @@ class KMCBatchGUI:
         # Disable run button during processing
         self.run_button.config(state='disabled')
         
+        # Create a normalized_fasta subfolder in working directory
+        normalized_dir = Path(work_dir) / "normalized_fasta"
+        normalized_dir.mkdir(parents=True, exist_ok=True)
+        
         # Process each file
         processed_dbs = []
         errors = []
@@ -142,22 +181,30 @@ class KMCBatchGUI:
             file_name = fasta_file.stem
             self.log(f"\n[{i}/{len(fasta_files)}] Processing: {fasta_file.name}")
             
+            # Normalize FASTA file first
+            normalized_file = normalized_dir / fasta_file.name
+            self.log(f"  Normalizing FASTA format...")
+            if not self.normalize_fasta(fasta_file, normalized_file):
+                errors.append(f"Failed to normalize {fasta_file.name}")
+                continue
+            self.log(f"  ✓ FASTA normalized")
+            
             # Create output subfolder
             file_output_dir = Path(output_folder) / file_name
             file_output_dir.mkdir(parents=True, exist_ok=True)
             
             output_db = str(file_output_dir / file_name)
             
-            # Run KMC
+            # Run KMC with normalized file
             self.log(f"  Running KMC...")
             kmc_cmd = [
                 kmc_exe,
                 f"-k{k}", f"-m{m}", f"-t{t}",
-                "-fa", str(fasta_file), output_db, work_dir
+                "-fa", str(normalized_file), output_db, work_dir
             ]
             
             try:
-                subprocess.run(kmc_cmd, check=True, capture_output=True, text=True)
+                result = subprocess.run(kmc_cmd, check=True, capture_output=True, text=True)
                 self.log(f"  ✓ KMC completed")
                 
                 # Run kmc_tools dump
@@ -172,6 +219,8 @@ class KMCBatchGUI:
                 
             except subprocess.CalledProcessError as e:
                 error_msg = f"  ✗ ERROR processing {fasta_file.name}: {str(e)}"
+                if e.stderr:
+                    error_msg += f"\n    stderr: {e.stderr}"
                 self.log(error_msg)
                 errors.append(error_msg)
         
@@ -224,6 +273,46 @@ class KMCBatchGUI:
             self.log(f"  ✓ Concatenation completed: combination_raw.txt")
         except Exception as e:
             error_msg = f"  ✗ ERROR creating combination_raw: {str(e)}"
+            self.log(error_msg)
+            errors.append(error_msg)
+        
+        # Create binary_existence (count files where each k-mer appears)
+        self.log("\nCreating binary_existence (presence/absence across files)...")
+        binary_dir = Path(output_folder) / "binary_existence"
+        binary_dir.mkdir(parents=True, exist_ok=True)
+        binary_file = binary_dir / "binary_existence.txt"
+        
+        try:
+            kmer_file_count = {}  # k-mer -> count of files it appears in
+            
+            for db_path in processed_dbs:
+                db_dir = Path(db_path).parent
+                dump_file = db_dir / f"{Path(db_path).name}_dump.txt"
+                if dump_file.exists():
+                    kmers_in_this_file = set()
+                    with open(dump_file, 'r') as infile:
+                        for line in infile:
+                            line = line.strip()
+                            if line and not line.startswith('#'):
+                                parts = line.split()
+                                if len(parts) >= 1:
+                                    kmer = parts[0]
+                                    kmers_in_this_file.add(kmer)
+                    
+                    # Add 1 to count for each unique k-mer seen in this file
+                    for kmer in kmers_in_this_file:
+                        kmer_file_count[kmer] = kmer_file_count.get(kmer, 0) + 1
+            
+            # Write results sorted by k-mer
+            with open(binary_file, 'w') as outfile:
+                outfile.write("# k-mer\tfile_count\n")
+                for kmer in sorted(kmer_file_count.keys()):
+                    outfile.write(f"{kmer}\t{kmer_file_count[kmer]}\n")
+            
+            self.log(f"  ✓ Binary existence completed: binary_existence.txt")
+            self.log(f"  Total unique k-mers across all files: {len(kmer_file_count)}")
+        except Exception as e:
+            error_msg = f"  ✗ ERROR creating binary_existence: {str(e)}"
             self.log(error_msg)
             errors.append(error_msg)
         
